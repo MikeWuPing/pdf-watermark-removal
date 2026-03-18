@@ -1,6 +1,6 @@
 # PDF Watermark Removal Skill
 
-一个用于 Claude Code 的 Skill，通过分析 PDF 内部结构识别并移除水印，同时保持正常内容完整。
+一个用于 Claude Code 和 OpenClaw 的 Skill，通过分析 PDF 内部结构识别并移除水印，同时保持正常内容完整。
 
 ## 功能特性
 
@@ -11,7 +11,7 @@
 
 ## 安装
 
-将 `SKILL.md` 放置到 Claude Code 的 skills 目录：
+Claude Code Skill的安装方法，OpenClaw只是目录不同，方法类似：将 `SKILL.md` 放置到Claude Code 的 skills 目录：
 
 ```bash
 # Windows
