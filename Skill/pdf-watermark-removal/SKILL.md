@@ -1,131 +1,118 @@
 ---
 name: pdf-watermark-removal
-description: Use when PDF contains watermarks that need removal, especially watermarks with custom fonts like AAAAAB+Helvetica-Bold, or when asked to clean/remove watermarks from PDF documents
+description: Use when PDF contains watermarks that need removal — covers XObject-embedded watermarks drawn via Do commands and content-stream text watermarks (text drawn directly in the page stream with a distinctive embedded subset font), or when asked to clean/remove watermarks from PDF documents. Not for scanned image watermarks or encrypted PDFs.
 ---
 
 # PDF 水印移除
 
 ## 概述
 
-通过分析 PDF 内部结构，识别并移除水印 XObject，同时保持正常内容完整。核心原理：水印通常是 Form XObject，通过 Do 命令绘制到页面，通过检测水印特征字体找到对应的 XObject 并移除其绘制命令。
+水印在 PDF 内部有两种常见形态：**XObject 型**（水印是 Form XObject，页面内容流通过 `Do` 命令绘制）和**内容流文本型**（水印文本用特征字体直接写在页面内容流中）。两者共性的可识别特征：**每页重复出现、且使用独立于正文的嵌入子集字体**（BaseFont 常有 `AAAA`/`AAAAAA` 等子集前缀，如 `AAAAAB+Helvetica-Bold`）。移除原则：定位水印字体 → 找到文字绘制的作用域 → 仅删除该作用域，正文内容流保持原样。
 
-## 何时使用
+## 识别类型（第一步，必做）
 
-- PDF 文档包含需要移除的水印
-- 水印使用特定字体（如 AAAAAB+Helvetica-Bold）
-- 需要批量处理 PDF 水印移除
-
-**不适用于：** 扫描件水印（图像层）、加密 PDF
-
-## 核心原理
-
-```
-Page → Resources → XObject → 水印XObject → 包含水印字体
-                 ↘ Contents → Do命令 → 绘制水印XObject
-```
-
-水印通常存在于 Form XObject 中，页面内容流通过 `q ... cm /Name Do Q` 命令块绘制。
-
-## 快速参考
-
-| 步骤 | 操作 |
-|------|------|
-| 1. 分析 | 检查 XObject 是否包含水印字体 |
-| 2. 定位 | 记录水印 XObject 的名称 |
-| 3. 移除 | 从内容流中删除 Do 命令块 |
-
-## 实现模式
-
-### 检测水印 XObject
+误判类型是"报告无水印但水印还在"最常见的原因。先统计每页字体分布：
 
 ```python
-def check_xobject_has_watermark_font(obj, depth=0, max_depth=10):
-    """递归检查 XObject 是否包含水印字体"""
-    if depth > max_depth:
-        return False
-
-    if hasattr(obj, 'get') and '/Resources' in obj:
-        res = obj['/Resources']
-        if hasattr(res, 'get_object'):
-            res = res.get_object()
-
-        # 检查字体
-        if '/Font' in res:
-            fonts = res['/Font']
-            if hasattr(fonts, 'get_object'):
-                fonts = fonts.get_object()
-
-            for name, ref in fonts.items():
-                font = ref.get_object() if hasattr(ref, 'get_object') else ref
-                base_font = font.get('/BaseFont', '') if hasattr(font, 'get') else ''
-                # 水印字体特征：AAAAAB+Helvetica-Bold
-                if 'AAAAAB+Helvetica-Bold' in str(base_font):
-                    return True
-
-        # 递归检查嵌套 XObject
-        if '/XObject' in res:
-            xo = res['/XObject']
-            if hasattr(xo, 'get_object'):
-                xo = xo.get_object()
-            for name, ref in xo.items():
-                inner = ref.get_object() if hasattr(ref, 'get_object') else ref
-                if check_xobject_has_watermark_font(inner, depth + 1, max_depth):
-                    return True
-
-    return False
+from collections import Counter
+with pdfplumber.open(pdf_path) as pdf:
+    for i, page in enumerate(pdf.pages[:3]):
+        print(f'第{i+1}页:', dict(Counter(c['fontname'] for c in page.chars)))
 ```
 
-### 移除 Do 命令块
+水印字体特征：每页**字符数恒定** × 使用**非正文的嵌入子集字体**。
+
+| 类型 | 内部特征 | 水印字体位置 | 移除点 |
+|------|----------|-------------|--------|
+| XObject 型 | 水印字体藏在 Form XObject 的 `/Resources` 中 | XObject 资源树 | 页面内容流中的 `q ... /Name Do Q` 块 |
+| 文本型 | 水印字体在页面顶级 `/Resources`，`BT...ET` 直接绘制 | 页面资源 | 内容流中含特征字体 `Tf` 的最外层 `q ... Q` 段 |
+
+扫描件水印（图像层）和加密 PDF 不适用本方法。
+
+## XObject 型移除
+
+1. 递归扫描 XObject 树，找包含水印字体的叶子（Form XObject 内 `/Font` 有特征 BaseFont），深度上限 20
+2. 追溯引用链，找到引用水印叶子的**页面级** XObject 名（如 `/_0`）
+3. 从页面内容流删除 `q ... cm /Name Do Q` 块：
 
 ```python
 import re
-import zlib
-from PyPDF2.generic import StreamObject, NameObject, NumberObject
-
-# PyPDF2 返回的 XObject 名称已包含斜杠，如 '/_1'
-for xobj_name in watermark_xobject_names:  # xobj_name = '/_1'
-    # 匹配格式: q\r\n1 0 0 1 X Y cm\r\n/Name Do\r\nQ
-    pattern = rf'q\r\n1 0 0 1 [\d.]+ [\d.]+ cm\r\n{re.escape(xobj_name)}\s+Do\r\nQ'
-    text = re.sub(pattern, '', text)
+# XObject 名已含斜杠，直接使用，勿再加 /
+pattern = rf'(?:Q\r\n)?q\r\n(?:[\d.\-]+ ){{5}}[\d.\-]+ cm\r\n{re.escape(xobj_name)}\s+Do\r\nQ'
 ```
 
-### 重建内容流
+4. 注意 XObject 名成对出现（如 `_0`/`_1`），检测到任一就同时移除两个
+
+## 文本型移除（核心）
 
 ```python
-# 重新压缩并创建新流
-new_data = zlib.compress(text.encode('latin-1'))
-stream = StreamObject()
-stream._data = new_data
-stream[NameObject('/Filter')] = NameObject('/FlateDecode')
-stream[NameObject('/Length')] = NumberObject(len(new_data))  # 必须用 NumberObject
+import pikepdf, re
+
+pdf = pikepdf.open(pdf_path)
+# 1. 从字体资源找特征字体名（匹配子集前缀或唯一非正文字体）
+wm_name = None
+for name, ref in pdf.pages[0].Resources['/Font'].items():
+    font = ref.get_object() if hasattr(ref, 'get_object') else ref
+    if 'AAAA' in str(font.get('/BaseFont', '')):  # 嵌入子集特征
+        wm_name = name
+assert wm_name, '未找到特征字体'
+
+for page in pdf.pages:
+    c = page.Contents
+    data = c.read_bytes().decode('latin-1', errors='ignore')
+    tfs = [m.start() for m in re.finditer(re.escape(wm_name) + r' [\d.]+ Tf', data)]
+    if not tfs:
+        continue
+    # 2. 定位包围全部水印文本块的最外层 q...Q
+    q_pos = [m.start() for m in re.finditer(r'(?<![a-zA-Z0-9])q(?![a-zA-Z0-9])', data)]
+    Q_pos = [m.start() for m in re.finditer(r'(?<![a-zA-Z0-9])Q(?![a-zA-Z0-9])', data)]
+    start = [p for p in q_pos if p < tfs[0]][-1]
+    end = [p for p in Q_pos if p > tfs[-1]][0]
+    new_data = data[:start] + data[end+1:]
+    # 3. 结构安全断言
+    assert new_data.count('BT') == new_data.count('ET')
+    assert len(re.findall(r'(?<![a-zA-Z0-9])q(?![a-zA-Z0-9])', new_data)) == \
+           len(re.findall(r'(?<![a-zA-Z0-9])Q(?![a-zA-Z0-9])', new_data))
+    c.write(new_data.encode('latin-1', errors='ignore'))
+pdf.save(output_path)
+```
+
+水印块常见外部包裹：`q` + 旋转矩阵（如 `0.86603 0.5 -0.5 0.86603 0 0 cm`）+ 若干 `BT` 文本块 + `Q`，整段删除即可。
+
+## 验证方法
+
+```python
+import pdfplumber, fitz
+
+orig = pdfplumber.open(input_path); out = pdfplumber.open(output_path)
+wm_o = sum(1 for p in orig.pages for c in p.chars if 'AAAA' in c.get('fontname', ''))
+body_o = sum(1 for p in orig.pages for c in p.chars if 'AAAA' not in c.get('fontname', ''))
+wm_n = sum(1 for p in out.pages for c in p.chars if 'AAAA' in c.get('fontname', ''))
+body_n = sum(1 for p in out.pages for c in p.chars if 'AAAA' not in c.get('fontname', ''))
+print(f'水印字符: {wm_o} -> {wm_n}')   # 应归零
+print(f'正文字符: {body_o} -> {body_n}')  # 应完全一致
+# 渲染确认无损坏
+fitz.open(output_path)[0].get_pixmap(dpi=80)
 ```
 
 ## 常见陷阱
 
 | 问题 | 原因 | 解决方案 |
 |------|------|----------|
-| 正则不匹配 | XObject 名称已含斜杠 | 直接使用 `xobj_name`，不要再加 `/` |
-| ValueError: value must be PdfObject | 直接用整数设 Length | 用 `NumberObject(len)` 包装 |
-| 内容损坏 | 编码错误 | 用 `latin-1` 编码，设置 `errors='ignore'` |
-| 水印未移除 | 嵌套 XObject | 递归检查，设置合适的 max_depth |
-
-## 验证方法
-
-```python
-import pdfplumber
-
-# 检查水印字符是否已移除
-with pdfplumber.open(output_path) as pdf:
-    page = pdf.pages[0]
-    watermark_chars = [c for c in page.chars if 'AAAAAB' in c.get('fontname', '')]
-    print(f"剩余水印字符: {len(watermark_chars)}")
-```
+| 报告无水印但水印可见 | 误判类型：XObject 检测扫不到文本型 | 先做字体分布分析再选分支 |
+| 正则匹配失败 | 资源名含 `+`/`.` 等元字符 | `re.escape(资源名)` |
+| 内容流乱码/损坏 | 非 ASCII 字符 | 读写统一用 `latin-1` + `errors='ignore'` |
+| 删除后 PDF 损坏 | `q/Q` 或 `BT/ET` 不配对 | 删除后断言配对平衡 |
+| 保存 PermissionError | 输出文件带只读属性（`shutil.copy2` 遗留） | 先删除旧文件再 `pdf.save` |
+| 水印嵌套多层 XObject | 引用链长 | 递归检查，max_depth 到 20；用内容流含叶子名做二次验证 |
+| `/F2+0` 类资源名匹配困难 | 内容流里有 `+0` 后缀区分水印字体 | 精确匹配字体资源名，勿宽泛匹配 `/F2` |
 
 ## 依赖
 
 ```bash
-pip install PyPDF2 pdfplumber
+pip install pikepdf pdfplumber PyMuPDF
 ```
 
-- **PyPDF2**: 读写 PDF，操作内部结构
-- **pdfplumber**: 验证结果，分析字符
+- **pikepdf**：结构操作与内容流读写（`stream.write()` 直接改写，无需手工重建流）
+- **pdfplumber**：字体分布分析、字符级验证
+- **PyMuPDF (fitz)**：渲染完整性检查
